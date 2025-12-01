@@ -7,138 +7,182 @@ description: Client MCP officiel basé sur python-mcp.
              Workflow sécurisé : list → schema → call. 
              Auto-fix JSON LLM. Compatible FireCrawl, Browser, Playwright, etc.
 """
+
 import os
 import json
 import json5
+import asyncio
 from json_repair import repair_json
-
-from mcp import Client
 from pydantic import Field
+from mcp import ClientSession
+from mcp.transport.http import HTTPClientTransport
 
 
-def safe_json_parse(text: str) -> dict:
+# ============================================================
+# 🔧 FIX JSON (tolère erreurs LLM)
+# ============================================================
+
+def fix_json(data: str) -> dict:
     """
-    Parse du JSON avec auto-réparation.
+    Répare automatiquement du JSON malformé.
+    - JSON natif
+    - JSON5
+    - réparation json-repair
     """
     try:
-        return json.loads(text)
+        return json.loads(data)
     except:
         pass
 
     try:
-        return json5.loads(text)
+        return json5.loads(data)
     except:
         pass
 
     try:
-        return json.loads(repair_json(text))
+        repaired = repair_json(data)
+        return json.loads(repaired)
     except Exception as e:
-        return {"error": f"JSON parsing failed: {str(e)}"}
+        raise ValueError(
+            f"Impossible de parser/réparer le JSON.\nErreur : {e}\nEntrée : {data}"
+        )
 
+
+# ============================================================
+# 🔧 MCP Python Client Tools
+# ============================================================
 
 class Tools:
+
     def __init__(self):
-        # Configuration multi-serveurs MCP
-        self.servers = {
-            "firecrawl": os.getenv(
-                "MCP_FIRECRAWL_URL",
-                "http://host.docker.internal:40001/firecrawl-mcp/mcp"
-            ),
-            "browser": os.getenv(
-                "MCP_BROWSER_URL",
-                "http://host.docker.internal:40001/browser/mcp"
-            )
-        }
-
-        self.clients = {}  # cache des clients MCP déjà initialisés
+        # Cache interne
+        self._tools_list = []
+        self._schema_cache = {}
         self.valves = self.Valves()
-        self.servers = self.valves.get("servers")
-        if sell.servers is None:
-          raise Exception("Please provide servers")
-        self.servers = {i.split(":")[0].strip(): i.split(":")[1].strip() for i in self.servers.split(";")}
 
+        self.mcp_url = self.valves.get("server_url")
+    
     class Valves(BaseModel):
-        servers: str = Field("", description="Your MCP servers (name1: url1;name2: url2)")
+        server_url: str = Field("", description="Your MCP server url")
 
-    # ======================
-    # INTERNALS
-    # ======================
 
-    def _get_client(self, server_name: str) -> Client:
+    # ============================================================
+    # 🔹 Helpers MCP
+    # ============================================================
+
+    async def _create_session(self):
+        """Crée une session MCP officielle."""
+        transport = HTTPClientTransport(self.mcp_url)
+        session = ClientSession(transport=transport)
+        await session.initialize()
+        return session
+
+
+    # ============================================================
+    # 1️⃣ LIST TOOLS (name + description seulement)
+    # ============================================================
+
+    def mcp_list_tools(self) -> str:
         """
-        Récupère ou instancie un client MCP python-mcp.
+        Liste les tools MCP :
+        - name
+        - description
+        
+        👉 Le LLM DOIT appeler cette fonction avant toute autre.
         """
-        if server_name not in self.servers:
-            raise ValueError(f"Unknown server '{server_name}'. Use mcp_list_servers().")
 
-        url = self.servers[server_name]
+        async def _run():
+            session = await self._create_session()
+            tools = await session.list_tools()
 
-        if server_name not in self.clients:
-            self.clients[server_name] = Client(url)
+            cleaned = []
+            for t in tools:
+                fn = t.function
+                cleaned.append({
+                    "name": fn.name,
+                    "description": fn.description
+                })
 
-        return self.clients[server_name]
+            # on stocke pour logique LLM
+            self._tools_list = cleaned
+            return cleaned
 
-    # ======================
-    # PUBLIC TOOLS
-    # ======================
+        result = asyncio.run(_run())
+        return json.dumps(result, indent=2, ensure_ascii=False)
 
-    def mcp_list_servers(self) -> str:
-        """
-        Liste tous les serveurs MCP configurés.
-        """
-        return json.dumps(list(self.servers.keys()), indent=2)
 
-    def mcp_list_tools(
-        self,
-        server_name: str = Field(..., description="Nom du serveur MCP.")
-    ) -> str:
-        """
-        Liste les tools d'un serveur MCP donné.
-        """
-        client = self._get_client(server_name)
-        tools = client.list_tools()
-
-        # Ne garder que name + description
-        cleaned = [
-            {"name": t.name, "description": t.description}
-            for t in tools
-        ]
-
-        return json.dumps(cleaned, indent=2, ensure_ascii=False)
+    # ============================================================
+    # 2️⃣ GET TOOL SCHEMA
+    # ============================================================
 
     def mcp_get_tool_schema(
         self,
-        server_name: str = Field(..., description="Nom du serveur MCP"),
-        tool_name: str = Field(..., description="Nom du tool à inspecter")
+        tool_name: str = Field(..., description="Nom exact du tool MCP.")
     ) -> str:
         """
-        Retourne le schéma complet d'un tool (paramètres).
+        Retourne le schéma complet (parameters, types, required).
+        
+        👉 Le LLM DOIT appeler ceci AVANT mcp_call_tool().
         """
-        client = self._get_client(server_name)
-        tools = client.list_tools()
 
-        for t in tools:
-            if t.name == tool_name:
-                return json.dumps(t.schema, indent=2, ensure_ascii=False)
+        async def _run():
+            session = await self._create_session()
+            tools = await session.list_tools()
 
-        return json.dumps({"error": "Tool not found"}, indent=2)
+            for t in tools:
+                fn = t.function
+                if fn.name == tool_name:
+                    schema = {
+                        "name": fn.name,
+                        "description": fn.description,
+                        "parameters": fn.parameters.model_json_schema()
+                    }
+                    self._schema_cache[tool_name] = schema
+                    return schema
+
+            return {"error": f"Tool '{tool_name}' introuvable."}
+
+        result = asyncio.run(_run())
+        return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+    # ============================================================
+    # 3️⃣ CALL TOOL (avec JSON auto-fix)
+    # ============================================================
 
     def mcp_call_tool(
         self,
-        server_name: str = Field(..., description="Nom du serveur MCP"),
-        tool_name: str = Field(..., description="Nom du tool MCP à appeler"),
+        tool_name: str = Field(..., description="Nom exact du tool MCP."),
         arguments_json: str = Field(
             "{}",
-            description="Arguments JSON (même incomplet, le système le répare)."
-        ),
+            description="JSON des arguments. Peut être malformé : auto-corrigé."
+        )
     ) -> str:
         """
-        Exécute un tool MCP avec auto-fix JSON.
+        Appelle un tool MCP avec JSON auto-fix.
+        
+        ⚠️ Ordre obligatoire :
+        1) mcp_list_tools
+        2) mcp_get_tool_schema
+        3) mcp_call_tool
         """
-        args = safe_json_parse(arguments_json)
 
-        client = self._get_client(server_name)
+        if tool_name not in self._schema_cache:
+            return (
+                f"⚠️ Schema non chargé pour `{tool_name}`.\n"
+                f"Veuillez appeler d’abord : mcp_get_tool_schema('{tool_name}')"
+            )
 
-        result = client.call_tool(tool_name, args)
+        try:
+            args = fix_json(arguments_json)
+        except Exception as e:
+            return f"❌ Erreur JSON : {e}"
 
+        async def _run():
+            session = await self._create_session()
+            result = await session.call_tool(tool_name, args)
+            return result.dict()
+
+        result = asyncio.run(_run())
         return json.dumps(result, indent=2, ensure_ascii=False)
+
