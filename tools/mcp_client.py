@@ -3,8 +3,8 @@ title: MCP Python Client
 version: 3.0.0
 author: Lucas
 requirements: python-mcp, json5, json-repair
-description: Client MCP officiel basé sur python-mcp. 
-             Workflow sécurisé : list → schema → call. 
+description: Client MCP officiel basé sur la lib python-mcp.
+             Workflow sécurisé : list → schema → call.
              Auto-fix JSON LLM. Compatible FireCrawl, Browser, Playwright, etc.
 """
 
@@ -13,14 +13,46 @@ import json
 import json5
 import asyncio
 from json_repair import repair_json
-from pydantic import Field
+from pydantic import BaseModel, Field
+
 from mcp import ClientSession
-from mcp.transport.http import HTTPClientTransport
+from mcp.client.streamable_http import streamablehttp_client
 
 
 # ============================================================
 # 🔧 FIX JSON (tolère erreurs LLM)
 # ============================================================
+
+
+def run_async_blocking(coro):
+    """
+    Runs an async coroutine from sync code, even inside uvloop / FastAPI / OpenWebUI.
+    Returns the result (awaited).
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        # uvloop running → schedule coro and wait for it
+        fut = asyncio.ensure_future(coro)
+        # Create a new event to block until completion
+        done_event = asyncio.Event()
+
+        def _done(_):
+            done_event.set()
+
+        fut.add_done_callback(_done)
+
+        # Block until coroutine completes
+        loop.run_until_complete(done_event.wait())
+        return fut.result()
+
+    else:
+        # No running loop → safe
+        return asyncio.run(coro)
+
 
 def fix_json(data: str) -> dict:
     """
@@ -31,12 +63,12 @@ def fix_json(data: str) -> dict:
     """
     try:
         return json.loads(data)
-    except:
+    except Exception:
         pass
 
     try:
         return json5.loads(data)
-    except:
+    except Exception:
         pass
 
     try:
@@ -52,31 +84,36 @@ def fix_json(data: str) -> dict:
 # 🔧 MCP Python Client Tools
 # ============================================================
 
+
 class Tools:
+    class Valves(BaseModel):
+        server_url: str = Field(
+            "http://host.docker.internal:40001/firecrawl-mcp/mcp",
+            description="URL de ton serveur MCP (HTTP streamable).",
+        )
 
     def __init__(self):
-        # Cache interne
-        self._tools_list = []
-        self._schema_cache = {}
+        # OpenWebUI va injecter `valves` automatiquement
         self.valves = self.Valves()
+        self.mcp_url = self.valves.server_url
 
-        self.mcp_url = self.valves.get("server_url")
-    
-    class Valves(BaseModel):
-        server_url: str = Field("", description="Your MCP server url")
-
+        # Cache interne
+        self._tools_list: list[dict] = []
+        self._schema_cache: dict[str, dict] = {}
 
     # ============================================================
-    # 🔹 Helpers MCP
+    # 🔹 Helpers MCP (async)
     # ============================================================
 
-    async def _create_session(self):
-        """Crée une session MCP officielle."""
-        transport = HTTPClientTransport(self.mcp_url)
-        session = ClientSession(transport=transport)
-        await session.initialize()
-        return session
-
+    async def _with_session(self, coro):
+        """
+        Helper pour créer une session MCP HTTP streamable, l'initialiser,
+        et exécuter une coroutine qui reçoit la session.
+        """
+        async with streamablehttp_client(self.mcp_url) as (read, write, *rest):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                return await coro(session)
 
     # ============================================================
     # 1️⃣ LIST TOOLS (name + description seulement)
@@ -87,29 +124,32 @@ class Tools:
         Liste les tools MCP :
         - name
         - description
-        
+
         👉 Le LLM DOIT appeler cette fonction avant toute autre.
         """
 
         async def _run():
-            session = await self._create_session()
-            tools = await session.list_tools()
+            async def _list(session: ClientSession):
+                list_result = await session.list_tools()
+                cleaned = []
+                for t in list_result.tools:
+                    fn = t.function
+                    cleaned.append(
+                        {
+                            "name": fn.name,
+                            "description": fn.description,
+                        }
+                    )
+                self._tools_list = cleaned
+                return cleaned
 
-            cleaned = []
-            for t in tools:
-                fn = t.function
-                cleaned.append({
-                    "name": fn.name,
-                    "description": fn.description
-                })
+            return await self._with_session(_list)
 
-            # on stocke pour logique LLM
-            self._tools_list = cleaned
-            return cleaned
-
-        result = asyncio.run(_run())
-        return json.dumps(result, indent=2, ensure_ascii=False)
-
+        try:
+            result = run_async_blocking(_run())
+            return json.dumps(result, indent=2, ensure_ascii=False)
+        except Exception as e:
+            return f"Error while listing MCP tools: {str(e)}"
 
     # ============================================================
     # 2️⃣ GET TOOL SCHEMA
@@ -117,34 +157,38 @@ class Tools:
 
     def mcp_get_tool_schema(
         self,
-        tool_name: str = Field(..., description="Nom exact du tool MCP.")
+        tool_name: str = Field(..., description="Nom exact du tool MCP."),
     ) -> str:
         """
         Retourne le schéma complet (parameters, types, required).
-        
+
         👉 Le LLM DOIT appeler ceci AVANT mcp_call_tool().
         """
 
         async def _run():
-            session = await self._create_session()
-            tools = await session.list_tools()
+            async def _get_schema(session: ClientSession):
+                list_result = await session.list_tools()
 
-            for t in tools:
-                fn = t.function
-                if fn.name == tool_name:
-                    schema = {
-                        "name": fn.name,
-                        "description": fn.description,
-                        "parameters": fn.parameters.model_json_schema()
-                    }
-                    self._schema_cache[tool_name] = schema
-                    return schema
+                for t in list_result.tools:
+                    fn = t.function
+                    if fn.name == tool_name:
+                        schema = {
+                            "name": fn.name,
+                            "description": fn.description,
+                            "parameters": fn.parameters.model_json_schema(),
+                        }
+                        self._schema_cache[tool_name] = schema
+                        return schema
 
-            return {"error": f"Tool '{tool_name}' introuvable."}
+                return {"error": f"Tool '{tool_name}' introuvable."}
 
-        result = asyncio.run(_run())
-        return json.dumps(result, indent=2, ensure_ascii=False)
+            return await self._with_session(_get_schema)
 
+        try:
+            result = run_async_blocking(_run())
+            return json.dumps(result, indent=2, ensure_ascii=False)
+        except Exception as e:
+            return f"Error while getting MCP tool schema: {str(e)}"
 
     # ============================================================
     # 3️⃣ CALL TOOL (avec JSON auto-fix)
@@ -155,13 +199,13 @@ class Tools:
         tool_name: str = Field(..., description="Nom exact du tool MCP."),
         arguments_json: str = Field(
             "{}",
-            description="JSON des arguments. Peut être malformé : auto-corrigé."
-        )
+            description="JSON des arguments. Peut être malformé : auto-corrigé.",
+        ),
     ) -> str:
         """
         Appelle un tool MCP avec JSON auto-fix.
-        
-        ⚠️ Ordre obligatoire :
+
+        ⚠️ Ordre recommandé :
         1) mcp_list_tools
         2) mcp_get_tool_schema
         3) mcp_call_tool
@@ -169,7 +213,7 @@ class Tools:
 
         if tool_name not in self._schema_cache:
             return (
-                f"⚠️ Schema non chargé pour `{tool_name}`.\n"
+                f"⚠️ Schéma non chargé pour `{tool_name}`.\n"
                 f"Veuillez appeler d’abord : mcp_get_tool_schema('{tool_name}')"
             )
 
@@ -179,10 +223,15 @@ class Tools:
             return f"❌ Erreur JSON : {e}"
 
         async def _run():
-            session = await self._create_session()
-            result = await session.call_tool(tool_name, args)
-            return result.dict()
+            async def _call(session: ClientSession):
+                call_result = await session.call_tool(tool_name, arguments=args)
+                # call_result est un CallToolResult (pydantic)
+                return call_result.model_dump(mode="json")
 
-        result = asyncio.run(_run())
-        return json.dumps(result, indent=2, ensure_ascii=False)
+            return await self._with_session(_call)
 
+        try:
+            result = run_async_blocking(_run())
+            return json.dumps(result, indent=2, ensure_ascii=False)
+        except Exception as e:
+            return f"Error while calling MCP tool '{tool_name}': {str(e)}"
