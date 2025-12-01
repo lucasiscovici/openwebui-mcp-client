@@ -1,0 +1,12 @@
+{
+  "name": "openwebui-mcp-client",
+  "version": "1.0.0",
+  "description": "Official python-mcp based client for MCP servers with JSON auto-fix.",
+  "author": "Lucas",
+  "entrypoint": "tools/mcp_client.py",
+  "requirements": [
+    "python-mcp",
+    "json5",
+    "json-repair"
+  ]
+}
