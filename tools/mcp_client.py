@@ -1,3 +1,12 @@
+"""
+title: MCP Python Client
+version: 3.0.0
+author: Lucas
+requirements: python-mcp, json5, json-repair
+description: Client MCP officiel basé sur python-mcp. 
+             Workflow sécurisé : list → schema → call. 
+             Auto-fix JSON LLM. Compatible FireCrawl, Browser, Playwright, etc.
+"""
 import os
 import json
 import json5
